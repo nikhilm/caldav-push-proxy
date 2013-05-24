@@ -2,25 +2,57 @@ package main
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"github.com/garyburd/redigo/redis"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
-	"encoding/xml"
 )
 
+type ServerConfig struct {
+	Hostname      string `json:"hostname"`
+	Port          string `json:"port"`
+	RedisHostname string `json:"redisHostname"`
+	RedisPort     string `json:"redisPort"`
+	UseTLS        bool   `json:"useTLS"`
+	CertFilename  string `json:"certFilename"`
+	KeyFilename   string `json:"keyFilename"`
+}
+
+var gServerConfig ServerConfig
+
+func readConfig() {
+
+	var data []byte
+	var err error
+
+	data, err = ioutil.ReadFile("config.json")
+	if err != nil {
+		log.Println("Not configured.  Could not find config.json")
+		os.Exit(-1)
+	}
+
+	err = json.Unmarshal(data, &gServerConfig)
+	if err != nil {
+		log.Println("Could not unmarshal config.json", err)
+		os.Exit(-1)
+		return
+	}
+}
+
 type MultiStatusResponse struct {
-    XMLName xml.Name `xml:"multistatus"`
-    Response struct {
-        Propstat struct {
-            Prop struct {
-                Getctag string `xml:"getctag"`
-            } `xml:"prop"`
-        } `xml:"propstat"`
-    }`xml:"response"`
+	XMLName  xml.Name `xml:"multistatus"`
+	Response struct {
+		Propstat struct {
+			Prop struct {
+				Getctag string `xml:"getctag"`
+			} `xml:"prop"`
+		} `xml:"propstat"`
+	} `xml:"response"`
 }
 
 var gRedis redis.Conn
@@ -53,28 +85,28 @@ func propfind(username, passwd, url string) (string, error) {
       </D:prop>
     </D:propfind>`
 
-    r, err := http.NewRequest("PROPFIND", url, strings.NewReader(body))
-    if err != nil {
-        return "", err
-    }
+	r, err := http.NewRequest("PROPFIND", url, strings.NewReader(body))
+	if err != nil {
+		return "", err
+	}
 
-    r.SetBasicAuth(username, passwd)
-    r.Header["Content-Type"] = []string{"application/xml"}
-    r.Header["Depth"] = []string{"0"}
-    resp, reqErr := calendarClient.Do(r)
-    if reqErr != nil {
-        return "", reqErr
-    }
+	r.SetBasicAuth(username, passwd)
+	r.Header["Content-Type"] = []string{"application/xml"}
+	r.Header["Depth"] = []string{"0"}
+	resp, reqErr := calendarClient.Do(r)
+	if reqErr != nil {
+		return "", reqErr
+	}
 
-    defer resp.Body.Close()
-    decoder := xml.NewDecoder(resp.Body)
-    v := MultiStatusResponse{}
-    parseErr := decoder.Decode(&v)
-    if parseErr != nil {
-        return "", parseErr
-    }
+	defer resp.Body.Close()
+	decoder := xml.NewDecoder(resp.Body)
+	v := MultiStatusResponse{}
+	parseErr := decoder.Decode(&v)
+	if parseErr != nil {
+		return "", parseErr
+	}
 
-    return v.Response.Propstat.Prop.Getctag, nil
+	return v.Response.Propstat.Prop.Getctag, nil
 }
 
 // Username uniquely identifies a user.
@@ -230,8 +262,6 @@ func checkCalendars(u Username, passwd, updateEndpoint, errorEndpoint string, ca
 	for calendar, syncToken := range calendars {
 		calendarUrl := fmt.Sprintf("%s%s", usernameParts[2], calendar)
 
-		log.Println("Checking", httpUsername, calendarUrl, syncToken)
-
 		newSyncToken, err := propfind(httpUsername, passwd, calendarUrl)
 		if err != nil {
 			log.Println("Error propfinding", err)
@@ -266,12 +296,6 @@ func pollCalendars() {
 		}
 
 		for _, entry := range entries {
-			passwd, found := gCredentials[Username(entry)]
-			if !found {
-				log.Println("Password not found for %s", entry)
-				continue
-			}
-
 			redisHash, getAllErr := redis.Strings(gRedis.Do("HGETALL", entry))
 			if getAllErr != nil {
 				log.Println("Could not get hash entry for %s", entry)
@@ -284,15 +308,26 @@ func pollCalendars() {
 			delete(hash, "updateEndpoint")
 			delete(hash, "errorEndpoint")
 
+			passwd, found := gCredentials[Username(entry)]
+			if !found {
+				log.Println("Password not found for", entry)
+				notifyEndpoint(errorEndpoint)
+				gRedis.Do("DEL", entry)
+				continue
+			}
+
 			go checkCalendars(Username(entry), passwd, updateEndpoint, errorEndpoint, hash)
 		}
 	}
 }
 
 func main() {
+
+	readConfig()
+
 	// Check that redis is working.
 	var err error
-	if gRedis, err = redis.Dial("tcp", "localhost:6379"); err != nil {
+	if gRedis, err = redis.Dial("tcp", fmt.Sprintf("%s:%s", gServerConfig.RedisHostname, gServerConfig.RedisPort)); err != nil {
 		log.Println(err == nil)
 		log.Fatal("Error connecting to Redis. %s", err)
 	}
@@ -303,6 +338,24 @@ func main() {
 	go pollCalendars()
 
 	http.HandleFunc("/register", registerHandler)
-	log.Println("Starting...")
+
+	var tls string
+	if gServerConfig.UseTLS {
+		tls = "(over TLS)"
+	}
+	log.Printf("Listening on %s:%s %s", gServerConfig.Hostname, gServerConfig.Port, tls)
+
+	if gServerConfig.UseTLS {
+		err = http.ListenAndServeTLS(gServerConfig.Hostname+":"+gServerConfig.Port,
+			gServerConfig.CertFilename,
+			gServerConfig.KeyFilename,
+			nil)
+	} else {
+		for i := 0; i < 5; i++ {
+			log.Println("This is a really unsafe way to run the push server.  Really.  Don't do this in production.")
+		}
+		err = http.ListenAndServe(gServerConfig.Hostname+":"+gServerConfig.Port, nil)
+	}
+
 	http.ListenAndServe("nikhilism.com:8009", nil)
 }
