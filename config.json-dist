@@ -1,0 +1,9 @@
+{
+  "hostname":      "0.0.0.0",
+  "port":          "8009",
+  "redisHostname": "localhost",
+  "redisPort":     "6379",
+  "useTLS":        true,
+  "certFilename":  "",
+  "keyFilename":   ""
+}
