@@ -77,38 +77,6 @@ func notifyEndpoint(endpoint string) {
 	}
 }
 
-func propfind(username, passwd, url string) (string, error) {
-	body := `<?xml version="1.0" encoding="utf-8" ?> 
-    <D:propfind xmlns:D="DAV:"> 
-      <D:prop xmlns:CS="http://calendarserver.org/ns/"> 
-        <CS:getctag/>
-      </D:prop>
-    </D:propfind>`
-
-	r, err := http.NewRequest("PROPFIND", url, strings.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-
-	r.SetBasicAuth(username, passwd)
-	r.Header["Content-Type"] = []string{"application/xml"}
-	r.Header["Depth"] = []string{"0"}
-	resp, reqErr := calendarClient.Do(r)
-	if reqErr != nil {
-		return "", reqErr
-	}
-
-	defer resp.Body.Close()
-	decoder := xml.NewDecoder(resp.Body)
-	v := MultiStatusResponse{}
-	parseErr := decoder.Decode(&v)
-	if parseErr != nil {
-		return "", parseErr
-	}
-
-	return v.Response.Propstat.Prop.Getctag, nil
-}
-
 // Username uniquely identifies a user.
 // A User has 2 endpoints, one for updates and one for errors.
 // A User also has calendars
@@ -120,15 +88,23 @@ func username(username string, domain string) Username {
 }
 
 // Mapping from Username -> password.
+// or Username -> oauth access_token
 // Should be kept strictly in memory and not logged.
-type Credentials map[Username]string
+type C struct {
+	Token   string
+	IsOauth bool
+}
+type Credentials map[Username]C
 
 var gCredentials Credentials
 
 type AccountModel struct {
-	Domain         string `json:"domain"`
-	User           string `json:"user"`
-	Password       string `json:"password"`
+	Domain   string `json:"domain"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+	Oauth    struct {
+		AccessToken string `json:"access_token"`
+	} `json:"oauth"`
 	UpdateEndpoint string `json:"updateEndpoint"`
 	ErrorEndpoint  string `json:"errorEndpoint"`
 }
@@ -167,6 +143,42 @@ func askClientsToRegisterAgain() {
 			notifyErrorToUser(Username(user))
 		}
 	}
+}
+
+func propfind(account AccountModel, url string) (string, error) {
+	body := `<?xml version="1.0" encoding="utf-8" ?>
+    <D:propfind xmlns:D="DAV:">
+      <D:prop xmlns:CS="http://calendarserver.org/ns/">
+        <CS:getctag/>
+      </D:prop>
+    </D:propfind>`
+
+	r, err := http.NewRequest("PROPFIND", url, strings.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+
+	if account.Oauth.AccessToken != "" {
+		r.Header["Authorization"] = []string{fmt.Sprintf("Bearer %s", account.Oauth.AccessToken)}
+	} else {
+		r.SetBasicAuth(account.User, account.Password)
+	}
+	r.Header["Content-Type"] = []string{"application/xml"}
+	r.Header["Depth"] = []string{"0"}
+	resp, reqErr := calendarClient.Do(r)
+	if reqErr != nil {
+		return "", reqErr
+	}
+
+	defer resp.Body.Close()
+	decoder := xml.NewDecoder(resp.Body)
+	v := MultiStatusResponse{}
+	parseErr := decoder.Decode(&v)
+	if parseErr != nil {
+		return "", parseErr
+	}
+
+	return v.Response.Propstat.Prop.Getctag, nil
 }
 
 // Redis storage is as a hash with base key the username.
@@ -233,7 +245,11 @@ func registerHandler(resp http.ResponseWriter, req *http.Request) {
 	}
 
 	username := username(request.User.User, request.User.Domain)
-	gCredentials[username] = request.User.Password
+	if request.User.Oauth.AccessToken != "" {
+		gCredentials[username] = C{request.User.Oauth.AccessToken, true}
+	} else {
+		gCredentials[username] = C{request.User.Password, false}
+	}
 
 	redisHash := redisHashFromRequest(request)
 	if len(redisHash)%2 != 0 {
@@ -250,22 +266,22 @@ func registerHandler(resp http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func checkCalendars(u Username, passwd, updateEndpoint, errorEndpoint string, calendars map[string]string) {
-	usernameParts := strings.Split(string(u), "::")
+func checkCalendars(account AccountModel, calendars map[string]string) {
+	username := username(account.User, account.Domain)
+	usernameParts := strings.Split(string(username), "::")
 	if len(usernameParts) != 3 {
-		log.Panic("Bad username %s", u)
+		log.Panic("Bad username %s", usernameParts)
 	}
-
-	httpUsername := usernameParts[1]
 
 	anyCalendarChanged := false
 	for calendar, syncToken := range calendars {
 		calendarUrl := fmt.Sprintf("%s%s", usernameParts[2], calendar)
 
-		newSyncToken, err := propfind(httpUsername, passwd, calendarUrl)
+		newSyncToken, err := propfind(account, calendarUrl)
 		if err != nil {
 			log.Println("Error propfinding", err)
-			notifyEndpoint(errorEndpoint)
+			notifyEndpoint(account.ErrorEndpoint)
+			gRedis.Do("DEL", username)
 			// If any calendar fails, no point continuing
 			return
 		}
@@ -274,22 +290,23 @@ func checkCalendars(u Username, passwd, updateEndpoint, errorEndpoint string, ca
 			log.Println(calendarUrl, "changed")
 			anyCalendarChanged = true
 			// update our cache
-			if _, saveErr := gRedis.Do("HSET", u, calendar, newSyncToken); saveErr != nil {
-				log.Println("Error updating syncToken to", newSyncToken, "for", u, calendarUrl)
+			if _, saveErr := gRedis.Do("HSET", username, calendar, newSyncToken); saveErr != nil {
+				log.Println("Error updating syncToken to", newSyncToken, "for", username, calendarUrl)
 			}
 		}
 	}
 
 	if anyCalendarChanged {
-		notifyEndpoint(updateEndpoint)
+		notifyEndpoint(account.UpdateEndpoint)
 	}
 }
 
 // Of course this is not the right way to do constant time polling.
 func pollCalendars() {
 	for {
-		time.Sleep(5 * time.Second) // FIXME Minute
+		time.Sleep(15 * time.Second) // FIXME Minute
 		entries, err := redis.Strings(gRedis.Do("KEYS", "caldav-user:*"))
+		log.Println("Polling", len(entries), "users.")
 		if err != nil {
 			log.Println("Error fetching keys")
 			continue
@@ -313,10 +330,26 @@ func pollCalendars() {
 				log.Println("Password not found for", entry)
 				notifyEndpoint(errorEndpoint)
 				gRedis.Do("DEL", entry)
+				delete(gCredentials, Username(entry))
 				continue
 			}
 
-			go checkCalendars(Username(entry), passwd, updateEndpoint, errorEndpoint, hash)
+			usernameParts := strings.Split(entry, "::")
+			if len(usernameParts) != 3 {
+				log.Panic("Non len 3 %s", usernameParts)
+			}
+			x := AccountModel{
+				User:           usernameParts[1],
+				Domain:         usernameParts[2],
+				UpdateEndpoint: updateEndpoint,
+				ErrorEndpoint:  errorEndpoint,
+			}
+			if passwd.IsOauth {
+				x.Oauth.AccessToken = passwd.Token
+			} else {
+				x.Password = passwd.Token
+			}
+			go checkCalendars(x, hash)
 		}
 	}
 }
